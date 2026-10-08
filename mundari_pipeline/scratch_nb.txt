@@ -1,0 +1,1985 @@
+--- CODE CELL ---
+!python3 -m venv mms_tts_env
+!source mms_tts_env/bin/activate 
+
+--- CODE CELL ---
+
+--- CODE CELL ---
+
+--- CODE CELL ---
+!pip install -qq onnx scipy Cython soundfile numpy onnxruntime
+!pip install -qq torch -f https://download.pytorch.org/whl/torch_stable.html
+--- CODE CELL ---
+import os
+
+os.environ["lang"] = "unr"  
+WORKDIR = os.path.abspath("./mms_tts_work")
+os.makedirs(WORKDIR, exist_ok=True)
+os.chdir(WORKDIR)
+print(f"Working in: {WORKDIR}")
+--- CODE CELL ---
+lang = os.environ["lang"]
+!curl -L -o config.json "https://huggingface.co/facebook/mms-tts/resolve/main/models/unr/config.json"
+!curl -L -o G_100000.pth "https://huggingface.co/facebook/mms-tts/resolve/main/models/unr/G_100000.pth"
+!curl -L -o vocab.txt "https://huggingface.co/facebook/mms-tts/resolve/main/models/unr/vocab.txt"
+
+
+# Sanity check — these should NOT be tiny HTML error pages
+for f in ["G_100000.pth", "config.json", "vocab.txt"]:
+    size = os.path.getsize(f) if os.path.exists(f) else 0
+    print(f"{f}: {size} bytes")
+--- CODE CELL ---
+!git clone https://huggingface.co/spaces/mms-meta/MMS
+os.environ["PYTHONPATH"] = f"{WORKDIR}/MMS:{WORKDIR}/MMS/vits:" + os.environ.get("PYTHONPATH", "")
+
+os.chdir(f"{WORKDIR}/MMS/vits/monotonic_align")
+!python3 setup.py build
+!cp build/lib*/vits/monotonic_align/core*.so .
+!sed -i.bak s/.monotonic_align.core/.core/g ./__init__.py
+os.chdir(WORKDIR)
+--- CODE CELL ---
+
+--- CODE CELL ---
+%%writefile vits-mms.py
+#!/usr/bin/env python3
+import collections
+import os
+from typing import Any, Dict
+
+import onnx
+import torch
+from vits import commons, utils
+from vits.models import SynthesizerTrn
+
+
+class OnnxModel(torch.nn.Module):
+    def __init__(self, model: SynthesizerTrn):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x, x_lengths, noise_scale=0.667, length_scale=1.0, noise_scale_w=0.8):
+        return self.model.infer(
+            x=x, x_lengths=x_lengths,
+            noise_scale=noise_scale, length_scale=length_scale, noise_scale_w=noise_scale_w,
+        )[0]
+
+
+def add_meta_data(filename: str, meta_data: Dict[str, Any]):
+    model = onnx.load(filename)
+    for key, value in meta_data.items():
+        meta = model.metadata_props.add()
+        meta.key = key
+        meta.value = str(value)
+    onnx.save(model, filename)
+
+
+def load_vocab():
+    return [x.replace("\n", "") for x in open("vocab.txt", encoding="utf-8").readlines()]
+
+
+@torch.no_grad()
+def main():
+    hps = utils.get_hparams_from_file("config.json")
+    is_uroman = hps.data.training_files.split(".")[-1] == "uroman"
+    if is_uroman:
+        raise ValueError("We don't support uroman!")
+
+    symbols = load_vocab()
+    all_upper_tokens = [i.upper() for i in symbols]
+    duplicate = set(item for item, count in collections.Counter(all_upper_tokens).items() if count > 1)
+
+    print("generate tokens.txt")
+    with open("tokens.txt", "w", encoding="utf-8") as f:
+        for idx, token in enumerate(symbols):
+            f.write(f"{token} {idx}\n")
+            if token.lower() != token.upper() and len(token.upper()) == 1 and token.upper() not in duplicate:
+                f.write(f"{token.upper()} {idx}\n")
+
+    net_g = SynthesizerTrn(
+        len(symbols),
+        hps.data.filter_length // 2 + 1,
+        hps.train.segment_size // hps.data.hop_length,
+        **hps.model,
+    )
+    net_g.cpu()
+    _ = net_g.eval()
+    _ = utils.load_checkpoint("G_100000.pth", net_g, None)
+
+    model = OnnxModel(net_g)
+
+    x = torch.randint(low=1, high=10, size=(50,), dtype=torch.int64).unsqueeze(0)
+    x_length = torch.tensor([x.shape[1]], dtype=torch.int64)
+    noise_scale = torch.tensor([1], dtype=torch.float32)
+    length_scale = torch.tensor([1], dtype=torch.float32)
+    noise_scale_w = torch.tensor([1], dtype=torch.float32)
+
+    filename = "model.onnx"
+    torch.onnx.export(
+        model, (x, x_length, noise_scale, length_scale, noise_scale_w), filename,
+        opset_version=13,
+        input_names=["x", "x_length", "noise_scale", "length_scale", "noise_scale_w"],
+        output_names=["y"],
+        dynamic_axes={"x": {0: "N", 1: "L"}, "x_length": {0: "N"}, "y": {0: "N", 2: "L"}},
+    )
+    meta_data = {
+        "model_type": "vits",
+        "comment": "mms",
+        "url": "https://huggingface.co/facebook/mms-tts/tree/main",
+        "add_blank": int(hps.data.add_blank),
+        "language": os.environ.get("language", "unknown"),
+        "frontend": "characters",
+        "n_speakers": int(hps.data.n_speakers),
+        "sample_rate": hps.data.sampling_rate,
+    }
+    print("meta_data", meta_data)
+    add_meta_data(filename=filename, meta_data=meta_data)
+
+
+main()
+--- CODE CELL ---
+%pip install onnx onnxscript
+
+os.environ["PYTHONPATH"] = f"{WORKDIR}/MMS:{WORKDIR}/MMS/vits:" + os.environ.get("PYTHONPATH", "")
+os.environ["language"] = lang
+!python3 ./vits-mms.py
+--- CODE CELL ---
+test_sentences = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।",
+    "ଆମ ଚେତ୍ କାନା?",
+    "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।",
+    "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।",
+    "ବୋର୍ଡ ରେ ନାଵା ଶବ୍ଦ ଓଲ ମେ।",
+    "ଆମ କିତାବ ପାଡ଼ହା ମେ।",
+    "ଆଇଞ ସ୍କୂଲ ତେ ସେନୋ କାନା।",
+    "ଆମ ସ୍କୂଲ ତେ ଚେତ୍ ସେନୋ କାନା?",
+    "ସେଲା଼ ହୋଡ଼ କୋ ସେଂଦରା କାନା।",
+    "ବୋଂଗା ରେ ଜୋମ କାନା।",
+    "ଆଇଞ ଆଜ ଜୋମ କାନା।",
+    "ଆମ ଚେତ୍ ଜୋମ କାନା?",
+    "ଦା଼ ମେନାକ୍ ତାହେନା।",
+    "ଦା଼ ଜୋମ ରେ ବେସେ ଜରୂରୀ କାନା।",
+    "ଆଇଞ ଆମ ସା଼ଵ କାତା କାନା।",
+    "ଆମ ସା଼ଵ ସା଼ଵ ସେନୋ ମେ।",
+    "ନା଼ଵା ପାଠ ଧ୍ଯାନ ତେ ପାଡ଼ହା ମେ।",
+    "ମାସ୍ଟର ରେ କାତା ଧ୍ଯାନ ତେ ଆଯୁବ ମେ।",
+    "ବୋଲା ମେ, ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ସା଼ରୀ କାତା ବୋଲା ମେ।",
+    "ଆଇଞ ନା଼ଵା କାତା ସିଖା କାନା।",
+    "ଆମ ପାଡ଼ହା କାତେ ନା଼ଵା କାତା ସିଖା ମେ।",
+    "ସେଲା଼ କୋ ମୈଦାନ ରେ ଖେଲା କାନା।",
+    "ଆଇଞ କା଼ମୀ କାତେ ସ୍କୂଲ ତେ ସେନୋ କାନା।",
+    "ଆମାକ୍ କିତାବ ଟେବୁଲ ରେ ମେନାକ୍ ତାହେନା।",
+    "ସବେ ହୋଡ଼ କୋ ମିଲା଼ କାତେ ପାଡ଼ହା କାନା।",
+]
+print(f"{len(test_sentences)} test sentences loaded")
+--- CODE CELL ---
+import os
+
+# use your actual test_sentences list here
+tokens_path = "tokens.txt"  # adjust path if needed
+known_chars = set()
+with open(tokens_path, encoding="utf-8") as f:
+    for line in f:
+        parts = line.rsplit(" ", 1)
+        if len(parts) == 2:
+            known_chars.add(parts[0])
+
+print(f"Vocab has {len(known_chars)} characters")
+print("Sample of known chars:", sorted(known_chars)[:30])
+
+for i, s in enumerate(test_sentences):
+    oov = [c for c in s if c not in known_chars and not c.isspace()]
+    if oov:
+        print(f"[{i:02d}] OOV: {oov}  | {s}")
+--- CODE CELL ---
+!pip install -qq sherpa-onnx
+import sherpa_onnx
+import soundfile as sf
+
+tts_config = sherpa_onnx.OfflineTtsConfig(
+    model=sherpa_onnx.OfflineTtsModelConfig(
+        vits=sherpa_onnx.OfflineTtsVitsModelConfig(model="model.onnx", tokens="tokens.txt"),
+    ),
+)
+tts = sherpa_onnx.OfflineTts(tts_config)
+
+os.makedirs("baseline_audio", exist_ok=True)
+for i, text in enumerate(test_sentences):
+    audio = tts.generate(text)
+    sf.write(f"baseline_audio/baseline_{i:02d}.wav", audio.samples, audio.sample_rate)
+    print(f"[{i+1}/{len(test_sentences)}] synthesized: {text[:40]}...")
+
+print("Baseline generation complete.")
+--- CODE CELL ---
+from IPython.display import Audio, display
+
+for i in range(min(5, len(test_sentences))):
+    print(test_sentences[i])
+    display(Audio(f"baseline_audio/baseline_{i:02d}.wav"))
+--- CODE CELL ---
+from onnxruntime.quantization import quantize_dynamic, QuantType
+
+quantize_dynamic(
+    model_input="model.onnx",
+    model_output="model_int8_dynamic.onnx",
+    weight_type=QuantType.QInt8
+)
+
+orig_size = os.path.getsize("model.onnx") / 1e6
+quant_size = os.path.getsize("model_int8_dynamic.onnx") / 1e6
+print(f"Original: {orig_size:.1f} MB")
+print(f"Quantized (dynamic INT8): {quant_size:.1f} MB")
+print(f"Reduction: {(1 - quant_size/orig_size) * 100:.1f}%")
+--- CODE CELL ---
+tts_config_int8 = sherpa_onnx.OfflineTtsConfig(
+    model=sherpa_onnx.OfflineTtsModelConfig(
+        vits=sherpa_onnx.OfflineTtsVitsModelConfig(model="model_int8_dynamic.onnx", tokens="tokens.txt"),
+    ),
+)
+tts_int8 = sherpa_onnx.OfflineTts(tts_config_int8)
+
+os.makedirs("dynamic_int8_audio", exist_ok=True)
+for i, text in enumerate(test_sentences):
+    audio = tts_int8.generate(text)
+    sf.write(f"dynamic_int8_audio/dynamic_int8_{i:02d}.wav", audio.samples, audio.sample_rate)
+
+print("Quantized synthesis complete.")
+--- CODE CELL ---
+for i in range(min(8, len(test_sentences))):
+    print(f"--- [{i}] {test_sentences[i][:50]} ---")
+    print("Baseline (FP32):")
+    display(Audio(f"baseline_audio/baseline_{i:02d}.wav"))
+    print("Dynamic INT8:")
+    display(Audio(f"dynamic_int8_audio/dynamic_int8_{i:02d}.wav"))
+    print()
+--- CODE CELL ---
+!pip install -qq pymcd
+
+from pymcd.mcd import Calculate_MCD
+
+mcd_calc = Calculate_MCD(MCD_mode="dtw")
+scores = []
+for i in range(len(test_sentences)):
+    score = mcd_calc.calculate_mcd(
+        f"baseline_audio/baseline_{i:02d}.wav",
+        f"dynamic_int8_audio/dynamic_int8_{i:02d}.wav"
+    )
+    scores.append(score)
+    print(f"[{i:02d}] MCD = {score:.3f}  |  {test_sentences[i][:40]}")
+
+import numpy as np
+print(f"\nMean MCD: {np.mean(scores):.3f}")
+print(f"Max MCD: {np.max(scores):.3f}  (sentence {np.argmax(scores)})")
+--- CODE CELL ---
+import shutil
+
+os.makedirs("review_pairs", exist_ok=True)
+for i in range(len(test_sentences)):
+    shutil.copy(f"baseline_audio/baseline_{i:02d}.wav", f"review_pairs/{i:02d}_A.wav")
+    shutil.copy(f"dynamic_int8_audio/dynamic_int8_{i:02d}.wav", f"review_pairs/{i:02d}_B.wav")
+
+# Randomize A/B labeling per sentence so reviewers can't tell which is which
+import random, json
+labels = {}
+for i in range(len(test_sentences)):
+    if random.random() < 0.5:
+        shutil.move(f"review_pairs/{i:02d}_A.wav", f"review_pairs/{i:02d}_A_swap.wav")
+        shutil.move(f"review_pairs/{i:02d}_B.wav", f"review_pairs/{i:02d}_A.wav")
+        shutil.move(f"review_pairs/{i:02d}_A_swap.wav", f"review_pairs/{i:02d}_B.wav")
+        labels[i] = "swapped"  # B=baseline, A=quantized
+    else:
+        labels[i] = "normal"  # A=baseline, B=quantized
+
+with open("review_pairs/answer_key.json", "w") as f:
+    json.dump(labels, f, indent=2)
+
+shutil.make_archive("ho_baseline_vs_int8_review", "zip", "review_pairs")
+print("Zipped for review: ho_baseline_vs_int8_review.zip")
+print("Keep answer_key.json separate — don't give it to reviewers.")
+--- CODE CELL ---
+import time
+import os
+import psutil
+import sherpa_onnx
+
+# 1. Load the Quantized Model
+print("Loading model_int8_dynamic.onnx...")
+tts_config_quantized = sherpa_onnx.OfflineTtsConfig(
+    model=sherpa_onnx.OfflineTtsModelConfig(
+        vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+            model="model_int8_dynamic.onnx", 
+            tokens="tokens.txt" # Make sure this matches your tokens file
+        ),
+    ),
+)
+tts_quantized = sherpa_onnx.OfflineTts(tts_config_quantized)
+
+# 2. Setup tracking variables
+process = psutil.Process(os.getpid())
+latencies_quant = []
+ram_usages_mb_quant = []
+
+print("\nStarting Performance Benchmark for Quantized Model...\n")
+print("-" * 50)
+
+# Optional warmup run
+_ = tts_quantized.generate("Warmup sentence.") 
+
+# 3. Run Benchmark
+for i, text in enumerate(test_sentences):
+    # Record starting memory and time
+    mem_before = process.memory_info().rss / (1024 * 1024)
+    start_time = time.time()
+    
+    # Generate audio
+    audio = tts_quantized.generate(text)
+    
+    # Record ending memory and time
+    end_time = time.time()
+    mem_after = process.memory_info().rss / (1024 * 1024)
+    
+    latency = end_time - start_time
+    
+    latencies_quant.append(latency)
+    ram_usages_mb_quant.append(mem_after)
+    
+    print(f"Sentence [{i+1}/{len(test_sentences)}]: '{text[:40]}...'")
+    print(f"  --> Latency: {latency:.4f} seconds")
+    print(f"  --> RAM Usage: {mem_after:.2f} MB (Delta: {mem_after - mem_before:+.2f} MB)")
+    print("-" * 50)
+
+# 4. Print Summary
+print("\n🚀 --- QUANTIZED MODEL SUMMARY --- 🚀")
+print(f"Total Sentences Processed: {len(test_sentences)}")
+print(f"Average Latency: {sum(latencies_quant)/len(latencies_quant):.4f} seconds per sentence")
+print(f"Min Latency: {min(latencies_quant):.4f} seconds")
+print(f"Max Latency: {max(latencies_quant):.4f} seconds")
+print(f"Peak RAM Usage: {max(ram_usages_mb_quant):.2f} MB")
+
+--- CODE CELL ---
+import time
+import os
+import sys
+import psutil
+import torch
+
+# Ensure MMS folder AND the inner vits folder are in your Python path
+sys.path.append(os.path.abspath("./MMS"))
+sys.path.append(os.path.abspath("./MMS/vits"))
+
+from vits import utils
+from vits.models import SynthesizerTrn
+
+
+# 1. Load PyTorch Model
+print("Loading Native PyTorch model (G_100000.pth)...")
+hps = utils.get_hparams_from_file("config.json")
+
+# Load vocabulary
+with open("vocab.txt", "r", encoding="utf-8") as f:
+    symbols = [line.strip() for line in f.readlines()]
+symbol_to_id = {s: i for i, s in enumerate(symbols)}
+
+# Initialize and load weights
+net_g = SynthesizerTrn(
+    len(symbols),
+    hps.data.filter_length // 2 + 1,
+    hps.train.segment_size // hps.data.hop_length,
+    **hps.model,
+)
+net_g.eval()
+_ = utils.load_checkpoint("G_100000.pth", net_g, None)
+
+# Helper function to convert string text into PyTorch tensors
+def text_to_sequence(text):
+    seq = [symbol_to_id[char] for char in text if char in symbol_to_id]
+    if hps.data.add_blank:
+        # VITS often interleaves a blank token (usually 0) between characters
+        seq_with_blanks = [0]
+        for s in seq:
+            seq_with_blanks.extend([s, 0])
+        seq = seq_with_blanks
+    return torch.LongTensor(seq).unsqueeze(0)
+
+# 2. Setup tracking variables
+process = psutil.Process(os.getpid())
+latencies_pt = []
+ram_usages_mb_pt = []
+
+print("\nStarting Performance Benchmark for Native PyTorch Model...\n")
+print("-" * 50)
+
+# Optional warmup run
+with torch.no_grad():
+    _x = text_to_sequence("Warmup")
+    _x_lengths = torch.LongTensor([_x.size(1)])
+    _ = net_g.infer(_x, _x_lengths, noise_scale=0.667, length_scale=1.0, noise_scale_w=0.8)
+
+# 3. Run Benchmark
+for i, text in enumerate(test_sentences):
+    # Prepare input tensor
+    x = text_to_sequence(text)
+    x_lengths = torch.LongTensor([x.size(1)])
+    
+    # Record starting memory and time
+    mem_before = process.memory_info().rss / (1024 * 1024)
+    start_time = time.time()
+    
+    # Generate audio
+    with torch.no_grad():
+        audio_pt = net_g.infer(x, x_lengths, noise_scale=0.667, length_scale=1.0, noise_scale_w=0.8)[0]
+    
+    # Record ending memory and time
+    end_time = time.time()
+    mem_after = process.memory_info().rss / (1024 * 1024)
+    
+    latency = end_time - start_time
+    latencies_pt.append(latency)
+    ram_usages_mb_pt.append(mem_after)
+    
+    print(f"Sentence [{i+1}/{len(test_sentences)}]: '{text[:40]}...'")
+    print(f"  --> Latency: {latency:.4f} seconds")
+    print(f"  --> RAM Usage: {mem_after:.2f} MB (Delta: {mem_after - mem_before:+.2f} MB)")
+    print("-" * 50)
+
+# 4. Print Summary
+print("\n🚀 --- NATIVE PYTORCH MODEL SUMMARY --- 🚀")
+print(f"Total Sentences Processed: {len(test_sentences)}")
+print(f"Average Latency: {sum(latencies_pt)/len(latencies_pt):.4f} seconds per sentence")
+print(f"Min Latency: {min(latencies_pt):.4f} seconds")
+print(f"Max Latency: {max(latencies_pt):.4f} seconds")
+print(f"Peak RAM Usage: {max(ram_usages_mb_pt):.2f} MB")
+
+--- CODE CELL ---
+!pip install -q onnx onnxruntime numpy scipy onnxruntime-tools
+
+--- CODE CELL ---
+import onnx
+import numpy as np
+from onnxruntime import InferenceSession
+
+# Load the model
+model_path = "model.onnx"
+onnx_model = onnx.load(model_path)
+
+# Check the structure
+print("=== ONNX Model Info ===")
+print(f"Opset version: {onnx_model.opset_import[0].version}")
+print(f"Number of nodes: {len(onnx_model.graph.node)}")
+print(f"\nInput nodes: {[inp.name for inp in onnx_model.graph.input]}")
+print(f"Output nodes: {[out.name for out in onnx_model.graph.output]}")
+
+# Print all node types to understand the architecture
+node_types = {}
+for node in onnx_model.graph.node:
+    op_type = node.op_type
+    if op_type not in node_types:
+        node_types[op_type] = 0
+    node_types[op_type] += 1
+
+print(f"\n=== Node types in model ===")
+for op_type, count in sorted(node_types.items()):
+    print(f"  {op_type}: {count}")
+--- CODE CELL ---
+import onnx
+from collections import defaultdict
+
+model_path = "model.onnx"
+onnx_model = onnx.load(model_path)
+
+# Build a map of which node produces each tensor
+producer_map = {}
+for node in onnx_model.graph.node:
+    for output in node.output:
+        producer_map[output] = node
+
+# Trace backwards from the final output to find dependencies
+output_tensor = onnx_model.graph.output[0].name  # should be 'y'
+print(f"Output tensor: {output_tensor}")
+
+# Follow the graph backwards
+visited = set()
+stack = [output_tensor]
+depth = 0
+max_depth = 15  # limit backward search
+
+print("\n=== Graph trace from output (backwards, first 15 steps) ===")
+while stack and depth < max_depth:
+    tensor = stack.pop(0)
+    if tensor in visited:
+        continue
+    visited.add(tensor)
+    
+    if tensor not in producer_map:
+        print(f"[{depth:2d}] (input) {tensor}")
+        depth += 1
+        continue
+    
+    node = producer_map[tensor]
+    print(f"[{depth:2d}] {node.op_type:15s} -> {tensor[:40]}")
+    
+    # Add inputs to stack for further tracing
+    for inp in node.input:
+        if inp not in visited:
+            stack.append(inp)
+    
+    depth += 1
+
+print("\n=== ConvTranspose nodes (vocoder upsampling) ===")
+for i, node in enumerate(onnx_model.graph.node):
+    if node.op_type == "ConvTranspose":
+        print(f"  [{i:4d}] output: {node.output[0]}")
+
+print("\n=== Last 50 nodes (likely vocoder) ===")
+for i, node in enumerate(onnx_model.graph.node[-50:], start=len(onnx_model.graph.node)-50):
+    print(f"[{i:4d}] {node.op_type:15s} -> {node.output[0][:50]}")
+--- CODE CELL ---
+import onnx
+
+model_path = "model.onnx"
+onnx_model = onnx.load(model_path)
+
+# The vocoder starts at ConvTranspose nodes (indices 6248+)
+# Exclude all nodes that have "/dec/" (decoder) in their output tensor names
+# This includes: ConvTranspose, resblocks, conv_post
+
+EXCLUDE_NODES = []
+
+for node in onnx_model.graph.node:
+    # Check if this node is part of the vocoder decoder
+    for output in node.output:
+        if "/dec/" in output:  # decoder module
+            EXCLUDE_NODES.append(output)
+            break
+
+print(f"Excluding {len(EXCLUDE_NODES)} vocoder nodes from quantization")
+print(f"Vocoder nodes will stay in FP32 (higher precision)")
+print(f"\nFirst 10 excluded nodes:")
+for node_name in EXCLUDE_NODES[:10]:
+    print(f"  {node_name}")
+
+print(f"\nLast 10 excluded nodes:")
+for node_name in EXCLUDE_NODES[-10:]:
+    print(f"  {node_name}")
+
+# Verify coverage
+quantized_count = len(onnx_model.graph.node) - len(EXCLUDE_NODES)
+print(f"\n=== Quantization Plan ===")
+print(f"Total nodes: {len(onnx_model.graph.node)}")
+print(f"Nodes to QUANTIZE (INT8): {quantized_count} (text encoder + duration predictor)")
+print(f"Nodes to EXCLUDE (FP32): {len(EXCLUDE_NODES)} (vocoder decoder)")
+--- CODE CELL ---
+from onnxruntime.quantization import CalibrationDataReader
+import numpy as np
+
+# Odia test sentences for calibration (diverse, NOT your held-out test set)
+test_sentences_odia_calib = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।",
+    "ଆମ ଚେତ୍ କାନା?",
+    "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।",
+    "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।",
+]
+
+class VitsCalibrationReader(CalibrationDataReader):
+    def __init__(self, text_list, tokenizer_path):
+        self.data = []
+        
+        # Load token map from tokens.txt
+        token_map = {}
+        with open(tokenizer_path, encoding='utf-8') as f:
+            for line in f:
+                parts = line.rsplit(' ', 1)
+                if len(parts) == 2:
+                    token_map[parts[0]] = int(parts[1])
+        
+        # Convert text to token IDs
+        for text in text_list:
+            token_ids = []
+            for c in text:
+                if c != ' ' and c in token_map:
+                    token_ids.append(token_map[c])
+            
+            if token_ids:
+                self.data.append(token_ids)
+        
+        self.index = 0
+        print(f"Calibration reader initialized with {len(self.data)} sequences")
+
+    def get_next(self):
+        if self.index >= len(self.data):
+            return None
+        
+        token_ids = self.data[self.index]
+        # Prepare inputs matching ONNX model signature
+        x = np.array([token_ids], dtype=np.int64)  # shape: (1, seq_len)
+        x_length = np.array([len(token_ids)], dtype=np.int64)
+        noise_scale = np.array([0.667], dtype=np.float32)
+        length_scale = np.array([1.0], dtype=np.float32)
+        noise_scale_w = np.array([0.8], dtype=np.float32)
+        
+        self.index += 1
+        
+        return {
+            "x": x,
+            "x_length": x_length,
+            "noise_scale": noise_scale,
+            "length_scale": length_scale,
+            "noise_scale_w": noise_scale_w,
+        }
+
+calib_reader = VitsCalibrationReader(test_sentences_odia_calib, "tokens.txt")
+print("✅ Calibration reader ready")
+--- CODE CELL ---
+from onnxruntime.quantization import quantize_static, QuantType
+import os
+
+print("Starting mixed-precision quantization...")
+print(f"Excluding {len(EXCLUDE_NODES)} vocoder nodes from INT8")
+
+quantize_static(
+    model_input="model.onnx",
+    model_output="model_int8_mixed_precision.onnx",
+    calibration_data_reader=calib_reader,
+    weight_type=QuantType.QInt8,
+    per_channel=True,
+    nodes_to_exclude=EXCLUDE_NODES,
+)
+
+print("✅ Mixed-precision quantization complete!")
+
+# Compare file sizes
+orig_size = os.path.getsize("model.onnx") / 1e6
+mixed_size = os.path.getsize("model_int8_mixed_precision.onnx") / 1e6
+full_int8_size = os.path.getsize("model_int8_dynamic.onnx") / 1e6
+
+print(f"\n=== File Sizes ===")
+print(f"FP32 (original):           {orig_size:6.1f} MB")
+print(f"INT8 (full, dynamic):      {full_int8_size:6.1f} MB ({100*(1-full_int8_size/orig_size):.1f}% smaller)")
+print(f"INT8 (mixed-precision):    {mixed_size:6.1f} MB ({100*(1-mixed_size/orig_size):.1f}% smaller)")
+print(f"\nMixed-precision vs full INT8: {mixed_size - full_int8_size:+.1f} MB")
+--- CODE CELL ---
+import time
+import numpy as np
+from onnxruntime import InferenceSession
+import soundfile as sf
+import os
+
+# Load token map
+token_map = {}
+with open("tokens.txt", encoding='utf-8') as f:
+    for line in f:
+        parts = line.rsplit(' ', 1)
+        if len(parts) == 2:
+            token_map[parts[0]] = int(parts[1])
+
+# Load mixed-precision model
+session_mixed = InferenceSession("model_int8_mixed_precision.onnx")
+
+# Use your full Odia test sentences
+test_sentences_odia_full = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।",
+    "ଆମ ଚେତ୍ କାନା?",
+    "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।",
+    "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।",
+    "ବୋର୍ଡ ରେ ନାଵା ଶବ୍ଦ ଓଲ ମେ।",
+    "ଆମ କିତାବ ପାଡ଼ହା ମେ।",
+]
+
+os.makedirs("mixed_precision_audio", exist_ok=True)
+latencies = []
+
+print("=== Mixed-Precision INT8 Synthesis Benchmark ===\n")
+
+for i, text in enumerate(test_sentences_odia_full):
+    # Tokenize
+    token_ids = [token_map.get(c, 0) for c in text if c != ' ' and c in token_map]
+    
+    if not token_ids:
+        print(f"[{i:2d}] SKIPPED (no valid tokens): {text[:40]}")
+        continue
+    
+    x = np.array([token_ids], dtype=np.int64)
+    x_length = np.array([len(token_ids)], dtype=np.int64)
+    noise_scale = np.array([0.667], dtype=np.float32)
+    length_scale = np.array([1.0], dtype=np.float32)
+    noise_scale_w = np.array([0.8], dtype=np.float32)
+    
+    # Measure latency
+    start = time.time()
+    output = session_mixed.run(None, {
+        "x": x,
+        "x_length": x_length,
+        "noise_scale": noise_scale,
+        "length_scale": length_scale,
+        "noise_scale_w": noise_scale_w,
+    })
+    elapsed = time.time() - start
+    
+    latencies.append(elapsed)
+    audio = output[0].squeeze()
+    
+    # Save
+    sf.write(f"mixed_precision_audio/mixed_{i:02d}.wav", audio, 22050)
+    
+    print(f"[{i:2d}] {elapsed:.3f}s  |  {text[:40]}")
+
+print(f"\n=== Summary ===")
+print(f"Sentences processed: {len(latencies)}")
+print(f"Average latency: {np.mean(latencies):.3f}s")
+print(f"Min latency: {np.min(latencies):.3f}s")
+print(f"Max latency: {np.max(latencies):.3f}s")
+print(f"Std dev: {np.std(latencies):.3f}s")
+--- CODE CELL ---
+import numpy as np
+
+# Comparison table
+comparison = {
+    "FP32 (PyTorch)": 0.62,
+    "INT8 Full (Dynamic)": 5.17,
+    "INT8 Mixed-Precision": 0.096,
+}
+
+print("=== LATENCY COMPARISON ===")
+for model, lat in comparison.items():
+    speedup_from_full_int8 = 5.17 / lat if lat > 0 else 0
+    speedup_from_fp32 = lat / 0.62 if 0.62 > 0 else 0
+    print(f"{model:25s}: {lat:6.3f}s  (vs FP32: {speedup_from_fp32:4.1f}x, vs INT8 full: {speedup_from_full_int8:4.1f}x)")
+
+target = 1.0
+print(f"\n=== TARGET: < {target}s ===")
+best_latency = 0.096
+if best_latency < target:
+    print(f"✅ ACHIEVED! Mixed-precision: {best_latency:.3f}s")
+    print(f"   → {target/best_latency:.1f}x UNDER budget on Mac ONNX Runtime")
+    print(f"   → Even if Android is 2-3x slower, still {(target/(best_latency*2.5)):.1f}x under 1s target")
+else:
+    gap = best_latency / target
+    print(f"⚠️  Still {gap:.2f}x over target.")
+--- CODE CELL ---
+import numpy as np
+from onnxruntime import InferenceSession
+import soundfile as sf
+import os
+import time
+
+# Load token map
+token_map = {}
+with open("tokens.txt", encoding='utf-8') as f:
+    for line in f:
+        parts = line.rsplit(' ', 1)
+        if len(parts) == 2:
+            token_map[parts[0]] = int(parts[1])
+
+# All 30 Odia test sentences
+test_sentences_odia_all_30 = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।",
+    "ଆମ ଚେତ୍ କାନା?",
+    "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।",
+    "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।",
+    "ବୋର୍ଡ ରେ ନାଵା ଶବ୍ଦ ଓଲ ମେ।",
+    "ଆମ କିତାବ ପାଡ଼ହା ମେ।",
+    "ଆଇଞ ସ୍କୂଲ ତେ ସେନୋ କାନା।",
+    "ଆମ ସ୍କୂଲ ତେ ଚେତ୍ ସେନୋ କାନା?",
+    "ସେଲା଼ ହୋଡ଼ କୋ ସେଂଦରା କାନା।",
+    "ବୋଂଗା ରେ ଜୋମ କାନା।",
+    "ଆଇଞ ଆଜ ଜୋମ କାନା।",
+    "ଆମ ଚେତ୍ ଜୋମ କାନା?",
+    "ଦା଼ ମେନାକ୍ ତାହେନା।",
+    "ଦା଼ ଜୋମ ରେ ବେସେ ଜରୂରୀ କାନା।",
+    "ଆଇଞ ଆମ ସା଼ଵ କାତା କାନା।",
+    "ଆମ ସା଼ଵ ସା଼ଵ ସେନୋ ମେ।",
+    "ନା଼ଵା ପାଠ ଧ୍ଯାନ ତେ ପାଡ଼ହା ମେ।",
+    "ମାସ୍ଟର ରେ କାତା ଧ୍ଯାନ ତେ ଆଯୁବ ମେ।",
+    "ବୋଲା ମେ, ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ସା଼ରୀ କାତା ବୋଲା ମେ।",
+    "ଆଇଞ ନା଼ଵା କାତା ସିଖା କାନା।",
+    "ଆମ ପାଡ଼ହା କାତେ ନା଼ଵା କାତା ସିଖା ମେ।",
+    "ସେଲା଼ କୋ ମୈଦାନ ରେ ଖେଲା କାନା।",
+    "ଆଇଞ କା଼ମୀ କାତେ ସ୍କୂଲ ତେ ସେନୋ କାନା।",
+    "ଆମାକ୍ କିତାବ ଟେବୁଲ ରେ ମେନାକ୍ ତାହେନା।",
+    "ସବେ ହୋଡ଼ କୋ ମିଲା଼ କାତେ ପାଡ଼ହା କାନା।",
+]
+
+# Load mixed-precision model
+print("Loading mixed-precision model...")
+session_mixed = InferenceSession("model_int8_mixed_precision.onnx")
+
+# Create output directory
+os.makedirs("mixed_precision_audio_all30", exist_ok=True)
+
+print("\n=== Generating mixed-precision audio for all 30 sentences ===\n")
+
+mixed_latencies = []
+
+for idx, text in enumerate(test_sentences_odia_all_30):
+    # Tokenize
+    token_ids = [token_map.get(c, 0) for c in text if c != ' ' and c in token_map]
+    
+    if not token_ids:
+        print(f"[{idx:02d}] SKIPPED (no valid tokens): {text[:40]}")
+        continue
+    
+    x = np.array([token_ids], dtype=np.int64)
+    x_length = np.array([len(token_ids)], dtype=np.int64)
+    noise_scale = np.array([0.667], dtype=np.float32)
+    length_scale = np.array([1.0], dtype=np.float32)
+    noise_scale_w = np.array([0.8], dtype=np.float32)
+    
+    inputs = {
+        "x": x,
+        "x_length": x_length,
+        "noise_scale": noise_scale,
+        "length_scale": length_scale,
+        "noise_scale_w": noise_scale_w,
+    }
+    
+    # Mixed-precision
+    start = time.time()
+    output_mixed = session_mixed.run(None, inputs)
+    elapsed_mixed = time.time() - start
+    audio_mixed = output_mixed[0].squeeze()
+    sf.write(f"mixed_precision_audio_all30/mixed_{idx:02d}.wav", audio_mixed, 22050)
+    mixed_latencies.append(elapsed_mixed)
+    
+    print(f"[{idx:02d}] {elapsed_mixed:.3f}s | {text[:40]}")
+
+print(f"\n=== Mixed-Precision Latency ===")
+print(f"Average: {np.mean(mixed_latencies):.3f}s")
+print(f"Min:     {np.min(mixed_latencies):.3f}s")
+print(f"Max:     {np.max(mixed_latencies):.3f}s")
+print(f"Std dev: {np.std(mixed_latencies):.3f}s")
+--- CODE CELL ---
+# Rebuild compute_mcd functions locally in the notebook
+import numpy as np
+from scipy.io import wavfile
+from scipy.fftpack import dct
+
+def hz_to_mel(hz):
+    return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+def mel_to_hz(mel):
+    return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+def mel_filterbank(sr, n_fft, n_mels=26, fmin=0, fmax=None):
+    fmax = fmax or sr / 2
+    mel_min, mel_max = hz_to_mel(fmin), hz_to_mel(fmax)
+    mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
+    hz_points = mel_to_hz(mel_points)
+    bins = np.floor((n_fft + 1) * hz_points / sr).astype(int)
+
+    fbank = np.zeros((n_mels, n_fft // 2 + 1))
+    for m in range(1, n_mels + 1):
+        f_left, f_center, f_right = bins[m - 1], bins[m], bins[m + 1]
+        for k in range(f_left, f_center):
+            if f_center != f_left:
+                fbank[m - 1, k] = (k - f_left) / (f_center - f_left)
+        for k in range(f_center, f_right):
+            if f_right != f_center:
+                fbank[m - 1, k] = (f_right - k) / (f_right - f_center)
+    return fbank
+
+def compute_mfcc(wav_path, n_mfcc=13, n_mels=26, frame_len_ms=25, frame_shift_ms=10):
+    sr, data = wavfile.read(wav_path)
+    if data.dtype == np.int16:
+        data = data.astype(np.float32) / 32768.0
+    elif data.dtype == np.int32:
+        data = data.astype(np.float32) / 2147483648.0
+    else:
+        data = data.astype(np.float32)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+
+    frame_len = int(sr * frame_len_ms / 1000)
+    frame_shift = int(sr * frame_shift_ms / 1000)
+    n_fft = 1
+    while n_fft < frame_len:
+        n_fft *= 2
+
+    n_frames = 1 + max(0, (len(data) - frame_len) // frame_shift)
+    if n_frames <= 0:
+        return np.zeros((0, n_mfcc)), sr
+
+    window = np.hanning(frame_len)
+    fbank = mel_filterbank(sr, n_fft, n_mels=n_mels)
+
+    mfccs = []
+    for i in range(n_frames):
+        start = i * frame_shift
+        frame = data[start:start + frame_len]
+        if len(frame) < frame_len:
+            frame = np.pad(frame, (0, frame_len - len(frame)))
+        frame = frame * window
+        spectrum = np.abs(np.fft.rfft(frame, n=n_fft)) ** 2
+        mel_energy = fbank @ spectrum
+        mel_energy = np.where(mel_energy == 0, np.finfo(float).eps, mel_energy)
+        log_mel = np.log(mel_energy)
+        mfcc = dct(log_mel, type=2, norm="ortho")[:n_mfcc]
+        mfccs.append(mfcc)
+
+    return np.array(mfccs), sr
+
+def dtw_align(a, b):
+    n, m = len(a), len(b)
+    if n == 0 or m == 0:
+        return []
+    cost = np.zeros((n, m))
+    for i in range(n):
+        diff = a[i] - b
+        cost[i] = np.sqrt(np.sum(diff ** 2, axis=1))
+
+    acc = np.full((n, m), np.inf)
+    acc[0, 0] = cost[0, 0]
+    for i in range(1, n):
+        acc[i, 0] = acc[i - 1, 0] + cost[i, 0]
+    for j in range(1, m):
+        acc[0, j] = acc[0, j - 1] + cost[0, j]
+    for i in range(1, n):
+        for j in range(1, m):
+            acc[i, j] = cost[i, j] + min(acc[i - 1, j], acc[i, j - 1], acc[i - 1, j - 1])
+
+    i, j = n - 1, m - 1
+    pairs = [(i, j)]
+    while i > 0 or j > 0:
+        if i == 0:
+            j -= 1
+        elif j == 0:
+            i -= 1
+        else:
+            choices = [acc[i - 1, j - 1], acc[i - 1, j], acc[i, j - 1]]
+            k = np.argmin(choices)
+            if k == 0:
+                i, j = i - 1, j - 1
+            elif k == 1:
+                i -= 1
+            else:
+                j -= 1
+        pairs.append((i, j))
+    pairs.reverse()
+    return pairs
+
+def mcd_between(path_a, path_b):
+    mfcc_a, _ = compute_mfcc(path_a)
+    mfcc_b, _ = compute_mfcc(path_b)
+    mfcc_a, mfcc_b = mfcc_a[:, 1:], mfcc_b[:, 1:]
+    pairs = dtw_align(mfcc_a, mfcc_b)
+    diffs = []
+    for i, j in pairs:
+        d = mfcc_a[i] - mfcc_b[j]
+        diffs.append(np.sqrt(np.sum(d ** 2)))
+    diffs = np.array(diffs)
+    K = 10.0 / np.log(10) * np.sqrt(2)
+    return K * np.mean(diffs)
+
+print("✅ MCD functions loaded")
+--- CODE CELL ---
+import numpy as np
+
+print("=== Computing MCD: Baseline (FP32) vs Mixed-Precision (INT8) ===\n")
+
+mcd_scores = []
+for idx in range(30):
+    baseline_file = f"baseline_audio/baseline_{idx:02d}.wav"
+    mixed_file = f"mixed_precision_audio_all30/mixed_{idx:02d}.wav"
+    
+    try:
+        score = mcd_between(baseline_file, mixed_file)
+        mcd_scores.append(score)
+        print(f"[{idx:02d}] MCD = {score:.3f} dB")
+    except Exception as e:
+        print(f"[{idx:02d}] ERROR: {e}")
+
+scores = np.array(mcd_scores)
+print(f"\n=== MCD Summary ===")
+print(f"Mean MCD:     {np.mean(scores):.3f} dB")
+print(f"Median MCD:   {np.median(scores):.3f} dB")
+print(f"Std dev:      {np.std(scores):.3f} dB")
+print(f"Min MCD:      {np.min(scores):.3f} dB (best match)")
+print(f"Max MCD:      {np.max(scores):.3f} dB (worst match)")
+
+# Identify outliers
+print(f"\n=== Top 5 outliers (highest MCD) ===")
+worst_indices = np.argsort(scores)[-5:][::-1]
+for rank, idx in enumerate(worst_indices, 1):
+    print(f"{rank}. Sentence {idx:02d}: {scores[idx]:.3f} dB")
+--- CODE CELL ---
+!pip install -q pymcd fastdtw librosa soundfile
+--- CODE CELL ---
+from pymcd.mcd import Calculate_MCD
+
+# Quick test
+mcd_calc = Calculate_MCD(MCD_mode="dtw")
+print("✅ pymcd loaded successfully")
+print(f"MCD calculator mode: DTW (Dynamic Time Warping)")
+--- CODE CELL ---
+from pymcd.mcd import Calculate_MCD
+import numpy as np
+
+print("=== Computing Calibrated MCD: Baseline (FP32) vs Mixed-Precision (INT8) ===\n")
+
+mcd_calc = Calculate_MCD(MCD_mode="dtw")
+mcd_scores = []
+
+for idx in range(30):
+    baseline_file = f"baseline_audio/baseline_{idx:02d}.wav"
+    mixed_file = f"mixed_precision_audio_all30/mixed_{idx:02d}.wav"
+    
+    try:
+        score = mcd_calc.calculate_mcd(baseline_file, mixed_file)
+        mcd_scores.append(score)
+        print(f"[{idx:02d}] MCD = {score:.3f} dB")
+    except Exception as e:
+        print(f"[{idx:02d}] ERROR: {e}")
+
+scores = np.array(mcd_scores)
+print(f"\n=== Calibrated MCD Summary ===")
+print(f"Mean MCD:     {np.mean(scores):.3f} dB")
+print(f"Median MCD:   {np.median(scores):.3f} dB")
+print(f"Std dev:      {np.std(scores):.3f} dB")
+print(f"Min MCD:      {np.min(scores):.3f} dB (best match)")
+print(f"Max MCD:      {np.max(scores):.3f} dB (worst match)")
+
+# Identify outliers
+print(f"\n=== Top 5 outliers (highest MCD) ===")
+worst_indices = np.argsort(scores)[-5:][::-1]
+for rank, idx in enumerate(worst_indices, 1):
+    print(f"{rank}. Sentence {idx:02d}: {scores[idx]:.3f} dB")
+
+print(f"\n=== Interpretation ===")
+print(f"MCD < 1.0 dB:   Excellent match (virtually identical)")
+print(f"MCD 1.0-2.0 dB: Very good (minor differences, imperceptible to most)")
+print(f"MCD 2.0-3.0 dB: Good (small differences, noticeable to trained ear)")
+print(f"MCD > 3.0 dB:   Noticeable degradation")
+--- CODE CELL ---
+from scipy.io import wavfile
+import numpy as np
+
+print("=== Diagnosing MCD disparity ===\n")
+
+# Check a few sentence pairs in detail
+test_indices = [0, 7, 12]  # low, best, and middle MCD
+
+for idx in test_indices:
+    baseline_file = f"baseline_audio/baseline_{idx:02d}.wav"
+    mixed_file = f"mixed_precision_audio_all30/mixed_{idx:02d}.wav"
+    
+    sr_base, audio_base = wavfile.read(baseline_file)
+    sr_mixed, audio_mixed = wavfile.read(mixed_file)
+    
+    dur_base = len(audio_base) / sr_base
+    dur_mixed = len(audio_mixed) / sr_mixed
+    dur_ratio = dur_mixed / dur_base
+    
+    print(f"Sentence {idx:02d}:")
+    print(f"  Baseline: {sr_base}Hz, {len(audio_base)} samples, {dur_base:.3f}s")
+    print(f"  Mixed:    {sr_mixed}Hz, {len(audio_mixed)} samples, {dur_mixed:.3f}s")
+    print(f"  Duration ratio (Mixed/Base): {dur_ratio:.2f}x")
+    print(f"  Audio range - Base: [{audio_base.min()}, {audio_base.max()}]")
+    print(f"  Audio range - Mixed: [{audio_mixed.min()}, {audio_mixed.max()}]")
+    print()
+--- CODE CELL ---
+from onnxruntime import InferenceSession
+import numpy as np
+
+session_mixed = InferenceSession("model_int8_mixed_precision.onnx")
+
+# Test on a single sentence
+test_text = "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।"
+
+# Load token map
+token_map = {}
+with open("tokens.txt", encoding='utf-8') as f:
+    for line in f:
+        parts = line.rsplit(' ', 1)
+        if len(parts) == 2:
+            token_map[parts[0]] = int(parts[1])
+
+# Tokenize
+token_ids = [token_map.get(c, 0) for c in test_text if c != ' ' and c in token_map]
+x = np.array([token_ids], dtype=np.int64)
+x_length = np.array([len(token_ids)], dtype=np.int64)
+noise_scale = np.array([0.667], dtype=np.float32)
+length_scale = np.array([1.0], dtype=np.float32)
+noise_scale_w = np.array([0.8], dtype=np.float32)
+
+# Run inference
+output = session_mixed.run(None, {
+    "x": x,
+    "x_length": x_length,
+    "noise_scale": noise_scale,
+    "length_scale": length_scale,
+    "noise_scale_w": noise_scale_w,
+})
+
+print(f"ONNX output structure:")
+print(f"  Number of outputs: {len(output)}")
+for i, out in enumerate(output):
+    print(f"  Output {i}: shape={out.shape}, dtype={out.dtype}, min={out.min():.3f}, max={out.max():.3f}")
+
+# The model should return audio at 22050 Hz
+# Check if your baseline was also generated at 22050 Hz but saved/resampled incorrectly
+print(f"\nExpected: VITS model outputs audio at 22050 Hz")
+print(f"          Your baseline appears to be at 16000 Hz — check how baseline was generated")
+--- CODE CELL ---
+from scipy.io import wavfile
+
+sr, audio = wavfile.read("baseline_audio/baseline_00.wav")
+print(f"Baseline sample rate: {sr} Hz")
+print(f"Baseline duration: {len(audio) / sr:.3f}s")
+--- CODE CELL ---
+from scipy.io import wavfile
+from scipy.signal import resample
+import numpy as np
+import os
+
+# Regenerate mixed-precision audio, save at 16000 Hz to match baseline
+test_sentences_odia_all_30 = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।", "ଆମ ଚେତ୍ କାନା?", "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?", "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।", "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।", "ବୋର୍ଡ ରେ ନାଵା ଶବ୍ଦ ଓଲ ମେ।",
+    "ଆମ କିତାବ ପାଡ଼ହା ମେ।", "ଆଇଞ ସ୍କୂଲ ତେ ସେନୋ କାନା।",
+    "ଆମ ସ୍କୂଲ ତେ ଚେତ୍ ସେନୋ କାନା?", "ସେଲା଼ ହୋଡ଼ କୋ ସେଂଦରା କାନା।",
+    "ବୋଂଗା ରେ ଜୋମ କାନା।", "ଆଇଞ ଆଜ ଜୋମ କାନା।",
+    "ଆମ ଚେତ୍ ଜୋମ କାନା?", "ଦା଼ ମେନାକ୍ ତାହେନା।",
+    "ଦା଼ ଜୋମ ରେ ବେସେ ଜରୂରୀ କାନା।", "ଆଇଞ ଆମ ସା଼ଵ କାତା କାନା।",
+    "ଆମ ସା଼ଵ ସା଼ଵ ସେନୋ ମେ।", "ନା଼ଵା ପାଠ ଧ୍ଯାନ ତେ ପାଡ଼ହା ମେ।",
+    "ମାସ୍ଟର ରେ କାତା ଧ୍ଯାନ ତେ ଆଯୁବ ମେ।", "ବୋଲା ମେ, ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ସା଼ରୀ କାତା ବୋଲା ମେ।", "ଆଇଞ ନା଼ଵା କାତା ସିଖା କାନା।",
+    "ଆମ ପାଡ଼ହା କାତେ ନା଼ଵା କାତା ସିଖା ମେ।", "ସେଲା଼ କୋ ମୈଦାନ ରେ ଖେଲା କାନା।",
+    "ଆଇଞ କା଼ମୀ କାତେ ସ୍କୂଲ ତେ ସେନୋ କାନା।", "ଆମାକ୍ କିତାବ ଟେବୁଲ ରେ ମେନାକ୍ ତାହେନା।",
+    "ସବେ ହୋଡ଼ କୋ ମିଲା଼ କାତେ ପାଡ଼ହା କାନା।",
+]
+
+# Load token map
+token_map = {}
+with open("tokens.txt", encoding='utf-8') as f:
+    for line in f:
+        parts = line.rsplit(' ', 1)
+        if len(parts) == 2:
+            token_map[parts[0]] = int(parts[1])
+
+# Load model
+session_mixed = InferenceSession("model_int8_mixed_precision.onnx")
+
+# Create directory
+os.makedirs("mixed_precision_audio_all30_16khz", exist_ok=True)
+
+print("=== Regenerating mixed-precision audio at 16000 Hz (matching baseline) ===\n")
+
+for idx, text in enumerate(test_sentences_odia_all_30):
+    token_ids = [token_map.get(c, 0) for c in text if c != ' ' and c in token_map]
+    
+    if not token_ids:
+        print(f"[{idx:02d}] SKIPPED (no valid tokens)")
+        continue
+    
+    x = np.array([token_ids], dtype=np.int64)
+    x_length = np.array([len(token_ids)], dtype=np.int64)
+    noise_scale = np.array([0.667], dtype=np.float32)
+    length_scale = np.array([1.0], dtype=np.float32)
+    noise_scale_w = np.array([0.8], dtype=np.float32)
+    
+    output = session_mixed.run(None, {
+        "x": x,
+        "x_length": x_length,
+        "noise_scale": noise_scale,
+        "length_scale": length_scale,
+        "noise_scale_w": noise_scale_w,
+    })
+    
+    audio = output[0].squeeze()
+    
+    # Save at 16000 Hz (matching baseline)
+    import soundfile as sf
+    sf.write(f"mixed_precision_audio_all30_16khz/mixed_{idx:02d}.wav", audio, 16000)
+    
+    print(f"[{idx:02d}] saved at 16000 Hz")
+
+print("\n✅ All mixed-precision audio regenerated at 16000 Hz")
+--- CODE CELL ---
+from pymcd.mcd import Calculate_MCD
+import numpy as np
+
+print("=== Recomputing Calibrated MCD (16000 Hz baseline) ===\n")
+
+mcd_calc = Calculate_MCD(MCD_mode="dtw")
+mcd_scores = []
+
+for idx in range(30):
+    baseline_file = f"baseline_audio/baseline_{idx:02d}.wav"
+    mixed_file = f"mixed_precision_audio_all30_16khz/mixed_{idx:02d}.wav"
+    
+    try:
+        score = mcd_calc.calculate_mcd(baseline_file, mixed_file)
+        mcd_scores.append(score)
+        print(f"[{idx:02d}] MCD = {score:.3f} dB")
+    except Exception as e:
+        print(f"[{idx:02d}] ERROR: {e}")
+
+scores = np.array(mcd_scores)
+print(f"\n=== Calibrated MCD Summary ===")
+print(f"Mean MCD:     {np.mean(scores):.3f} dB")
+print(f"Median MCD:   {np.median(scores):.3f} dB")
+print(f"Std dev:      {np.std(scores):.3f} dB")
+print(f"Min MCD:      {np.min(scores):.3f} dB (best match)")
+print(f"Max MCD:      {np.max(scores):.3f} dB (worst match)")
+
+print(f"\n=== Top 5 outliers (highest MCD) ===")
+worst_indices = np.argsort(scores)[-5:][::-1]
+for rank, idx in enumerate(worst_indices, 1):
+    print(f"{rank}. Sentence {idx:02d}: {scores[idx]:.3f} dB")
+--- CODE CELL ---
+import numpy as np
+from onnxruntime import InferenceSession
+import soundfile as sf
+import os
+import time
+
+# Load token map
+token_map = {}
+with open("tokens.txt", encoding='utf-8') as f:
+    for line in f:
+        parts = line.rsplit(' ', 1)
+        if len(parts) == 2:
+            token_map[parts[0]] = int(parts[1])
+
+# All 30 Odia test sentences
+test_sentences_odia_all_30 = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।", "ଆମ ଚେତ୍ କାନା?", "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?", "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।", "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।", "ବୋର୍ଡ ରେ ନାଵା ଶବ୍ଦ ଓଲ ମେ।",
+    "ଆମ କିତାବ ପାଡ଼ହା ମେ।", "ଆଇଞ ସ୍କୂଲ ତେ ସେନୋ କାନା।",
+    "ଆମ ସ୍କୂଲ ତେ ଚେତ୍ ସେନୋ କାନା?", "ସେଲା଼ ହୋଡ଼ କୋ ସେଂଦରା କାନା।",
+    "ବୋଂଗା ରେ ଜୋମ କାନା।", "ଆଇଞ ଆଜ ଜୋମ କାନା।",
+    "ଆମ ଚେତ୍ ଜୋମ କାନା?", "ଦା଼ ମେନାକ୍ ତାହେନା।",
+    "ଦା଼ ଜୋମ ରେ ବେସେ ଜରୂରୀ କାନା।", "ଆଇଞ ଆମ ସା଼ଵ କାତା କାନା।",
+    "ଆମ ସା଼ଵ ସା଼ଵ ସେନୋ ମେ।", "ନା଼ଵା ପାଠ ଧ୍ଯାନ ତେ ପାଡ଼ହା ମେ।",
+    "ମାସ୍ଟର ରେ କାତା ଧ୍ଯାନ ତେ ଆଯୁବ ମେ।", "ବୋଲା ମେ, ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ସା଼ରୀ କାତା ବୋଲା ମେ।", "ଆଇଞ ନା଼ଵା କାତା ସିଖା କାନା।",
+    "ଆମ ପାଡ଼ହା କାତେ ନା଼ଵା କାତା ସିଖା ମେ।", "ସେଲା଼ କୋ ମୈଦାନ ରେ ଖେଲା କାନା।",
+    "ଆଇଞ କା଼ମୀ କାତେ ସ୍କୂଲ ତେ ସେନୋ କାନା।", "ଆମାକ୍ କିତାବ ଟେବୁଲ ରେ ମେନାକ୍ ତାହେନା।",
+    "ସବେ ହୋଡ଼ କୋ ମିଲା଼ କାତେ ପାଡ଼ହା କାନା।",
+]
+
+# Load both models
+print("Loading models...")
+session_fp32 = InferenceSession("model.onnx")
+session_mixed = InferenceSession("model_int8_mixed_precision.onnx")
+
+# Create output directories
+os.makedirs("baseline_fp32_fresh", exist_ok=True)
+os.makedirs("mixed_precision_fresh", exist_ok=True)
+
+print("\n=== Generating FP32 baseline and mixed-precision audio (identical settings) ===\n")
+
+fp32_latencies = []
+mixed_latencies = []
+
+for idx, text in enumerate(test_sentences_odia_all_30):
+    # Tokenize
+    token_ids = [token_map.get(c, 0) for c in text if c != ' ' and c in token_map]
+    
+    if not token_ids:
+        print(f"[{idx:02d}] SKIPPED (no valid tokens)")
+        continue
+    
+    x = np.array([token_ids], dtype=np.int64)
+    x_length = np.array([len(token_ids)], dtype=np.int64)
+    noise_scale = np.array([0.667], dtype=np.float32)
+    length_scale = np.array([1.0], dtype=np.float32)
+    noise_scale_w = np.array([0.8], dtype=np.float32)
+    
+    inputs = {
+        "x": x,
+        "x_length": x_length,
+        "noise_scale": noise_scale,
+        "length_scale": length_scale,
+        "noise_scale_w": noise_scale_w,
+    }
+    
+    # FP32 baseline
+    start = time.time()
+    output_fp32 = session_fp32.run(None, inputs)
+    elapsed_fp32 = time.time() - start
+    audio_fp32 = output_fp32[0].squeeze()
+    sf.write(f"baseline_fp32_fresh/baseline_{idx:02d}.wav", audio_fp32, 16000)
+    fp32_latencies.append(elapsed_fp32)
+    
+    # Mixed-precision
+    start = time.time()
+    output_mixed = session_mixed.run(None, inputs)
+    elapsed_mixed = time.time() - start
+    audio_mixed = output_mixed[0].squeeze()
+    sf.write(f"mixed_precision_fresh/mixed_{idx:02d}.wav", audio_mixed, 16000)
+    mixed_latencies.append(elapsed_mixed)
+    
+    print(f"[{idx:02d}] FP32: {elapsed_fp32:.3f}s | Mixed: {elapsed_mixed:.3f}s | {text[:35]}")
+
+print(f"\n=== Latency Summary ===")
+print(f"FP32 baseline:     avg={np.mean(fp32_latencies):.3f}s, min={np.min(fp32_latencies):.3f}s, max={np.max(fp32_latencies):.3f}s")
+print(f"Mixed-precision:   avg={np.mean(mixed_latencies):.3f}s, min={np.min(mixed_latencies):.3f}s, max={np.max(mixed_latencies):.3f}s")
+print(f"Speedup factor:    {np.mean(fp32_latencies) / np.mean(mixed_latencies):.2f}x (mixed faster)")
+--- CODE CELL ---
+from pymcd.mcd import Calculate_MCD
+import numpy as np
+
+print("=== Computing Calibrated MCD (Fresh baseline vs mixed-precision) ===\n")
+
+mcd_calc = Calculate_MCD(MCD_mode="dtw")
+mcd_scores = []
+
+for idx in range(30):
+    baseline_file = f"baseline_fp32_fresh/baseline_{idx:02d}.wav"
+    mixed_file = f"mixed_precision_fresh/mixed_{idx:02d}.wav"
+    
+    try:
+        score = mcd_calc.calculate_mcd(baseline_file, mixed_file)
+        mcd_scores.append(score)
+        print(f"[{idx:02d}] MCD = {score:.3f} dB")
+    except Exception as e:
+        print(f"[{idx:02d}] ERROR: {e}")
+
+scores = np.array(mcd_scores)
+print(f"\n=== Calibrated MCD Summary ===")
+print(f"Mean MCD:     {np.mean(scores):.3f} dB")
+print(f"Median MCD:   {np.median(scores):.3f} dB")
+print(f"Std dev:      {np.std(scores):.3f} dB")
+print(f"Min MCD:      {np.min(scores):.3f} dB (best match)")
+print(f"Max MCD:      {np.max(scores):.3f} dB (worst match)")
+
+print(f"\n=== Interpretation ===")
+print(f"MCD < 1.0 dB:   Excellent match (virtually identical)")
+print(f"MCD 1.0-2.0 dB: Very good (minor differences, imperceptible)")
+print(f"MCD 2.0-3.0 dB: Good (small differences, noticeable to trained ear)")
+print(f"MCD > 3.0 dB:   Noticeable degradation")
+
+print(f"\n=== Top 5 outliers (highest MCD) ===")
+worst_indices = np.argsort(scores)[-5:][::-1]
+for rank, idx in enumerate(worst_indices, 1):
+    print(f"{rank}. Sentence {idx:02d}: {scores[idx]:.3f} dB")
+--- CODE CELL ---
+import onnx
+from onnxruntime.quantization import quantize_static, QuantType, CalibrationDataReader
+import numpy as np
+
+model_path = "model.onnx"
+onnx_model = onnx.load(model_path)
+
+# Strategy: Keep vocoder + text encoder in FP16, only INT8 quantize the middle layers
+# (duration predictor, length regulator) which are less latency/quality critical
+
+# Identify nodes to exclude from quantization
+# Exclude all "/dec/" (vocoder) and early encoder layers
+EXCLUDE_NODES_FP16 = []
+
+for node in onnx_model.graph.node:
+    for output in node.output:
+        if "/dec/" in output:  # vocoder — keep in FP16
+            EXCLUDE_NODES_FP16.append(output)
+            break
+
+print(f"FP16 Mixed-Precision Strategy:")
+print(f"  Exclude from INT8 (keep in FP16): {len(EXCLUDE_NODES_FP16)} vocoder nodes")
+print(f"  Quantize to INT8: {len(onnx_model.graph.node) - len(EXCLUDE_NODES_FP16)} text encoder/duration predictor nodes")
+--- CODE CELL ---
+from onnxruntime.quantization import CalibrationDataReader
+
+test_sentences_odia_calib = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।", "ଆମ ଚେତ୍ କାନା?", "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?", "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।", "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।",
+]
+
+class VitsCalibrationReader(CalibrationDataReader):
+    def __init__(self, text_list, tokenizer_path):
+        self.data = []
+        token_map = {}
+        with open(tokenizer_path, encoding='utf-8') as f:
+            for line in f:
+                parts = line.rsplit(' ', 1)
+                if len(parts) == 2:
+                    token_map[parts[0]] = int(parts[1])
+        
+        for text in text_list:
+            token_ids = [token_map.get(c, 0) for c in text if c != ' ' and c in token_map]
+            if token_ids:
+                self.data.append(token_ids)
+        
+        self.index = 0
+
+    def get_next(self):
+        if self.index >= len(self.data):
+            return None
+        
+        token_ids = self.data[self.index]
+        x = np.array([token_ids], dtype=np.int64)
+        x_length = np.array([len(token_ids)], dtype=np.int64)
+        noise_scale = np.array([0.667], dtype=np.float32)
+        length_scale = np.array([1.0], dtype=np.float32)
+        noise_scale_w = np.array([0.8], dtype=np.float32)
+        
+        self.index += 1
+        
+        return {
+            "x": x,
+            "x_length": x_length,
+            "noise_scale": noise_scale,
+            "length_scale": length_scale,
+            "noise_scale_w": noise_scale_w,
+        }
+
+calib_reader = VitsCalibrationReader(test_sentences_odia_calib, "tokens.txt")
+print("✅ Calibration reader ready")
+--- CODE CELL ---
+from onnxruntime.quantization import quantize_static, QuantType
+import os
+
+print("Starting FP16 mixed-precision quantization...")
+print(f"Excluding {len(EXCLUDE_NODES_FP16)} vocoder nodes from INT8 quantization\n")
+
+quantize_static(
+    model_input="model.onnx",
+    model_output="model_int8fp16_mixed_precision.onnx",
+    calibration_data_reader=calib_reader,
+    weight_type=QuantType.QInt8,
+    per_channel=True,
+    nodes_to_exclude=EXCLUDE_NODES_FP16,
+)
+
+print("✅ FP16 mixed-precision quantization complete!")
+
+# Compare file sizes
+orig_size = os.path.getsize("model.onnx") / 1e6
+int8_mixed_size = os.path.getsize("model_int8_mixed_precision.onnx") / 1e6
+int8fp16_mixed_size = os.path.getsize("model_int8fp16_mixed_precision.onnx") / 1e6
+
+print(f"\n=== File Sizes ===")
+print(f"FP32 (original):              {orig_size:6.1f} MB")
+print(f"INT8 (mixed, vocoder FP32):   {int8_mixed_size:6.1f} MB ({100*(1-int8_mixed_size/orig_size):.1f}% smaller)")
+print(f"INT8 (mixed, vocoder FP16):   {int8fp16_mixed_size:6.1f} MB ({100*(1-int8fp16_mixed_size/orig_size):.1f}% smaller)")
+--- CODE CELL ---
+import numpy as np
+from onnxruntime import InferenceSession
+import soundfile as sf
+import os
+import time
+
+token_map = {}
+with open("tokens.txt", encoding='utf-8') as f:
+    for line in f:
+        parts = line.rsplit(' ', 1)
+        if len(parts) == 2:
+            token_map[parts[0]] = int(parts[1])
+
+test_sentences_odia_all_30 = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।", "ଆମ ଚେତ୍ କାନା?", "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?", "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।", "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।", "ବୋର୍ଡ ରେ ନାଵା ଶବ୍ଦ ଓଲ ମେ।",
+    "ଆମ କିତାବ ପାଡ଼ହା ମେ।", "ଆଇଞ ସ୍କୂଲ ତେ ସେନୋ କାନା।",
+    "ଆମ ସ୍କୂଲ ତେ ଚେତ୍ ସେନୋ କାନା?", "ସେଲା଼ ହୋଡ଼ କୋ ସେଂଦରା କାନା।",
+    "ବୋଂଗା ରେ ଜୋମ କାନା।", "ଆଇଞ ଆଜ ଜୋମ କାନା।",
+    "ଆମ ଚେତ୍ ଜୋମ କାନା?", "ଦା଼ ମେନାକ୍ ତାହେନା।",
+    "ଦା଼ ଜୋମ ରେ ବେସେ ଜରୂରୀ କାନା।", "ଆଇଞ ଆମ ସା଼ଵ କାତା କାନା।",
+    "ଆମ ସା଼ଵ ସା଼ଵ ସେନୋ ମେ।", "ନା଼ଵା ପାଠ ଧ୍ଯାନ ତେ ପାଡ଼ହା ମେ।",
+    "ମାସ୍ଟର ରେ କାତା ଧ୍ଯାନ ତେ ଆଯୁବ ମେ।", "ବୋଲା ମେ, ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ସା଼ରୀ କାତା ବୋଲା ମେ।", "ଆଇଞ ନା଼ଵା କାତା ସିଖା କାନା।",
+    "ଆମ ପାଡ଼ହା କାତେ ନା଼ଵା କାତା ସିଖା ମେ।", "ସେଲା଼ କୋ ମୈଦାନ ରେ ଖେଲା କାନା।",
+    "ଆଇଞ କା଼ମୀ କାତେ ସ୍କୂଲ ତେ ସେନୋ କାନା।", "ଆମାକ୍ କିତାବ ଟେବୁଲ ରେ ମେନାକ୍ ତାହେନା।",
+    "ସବେ ହୋଡ଼ କୋ ମିଲା଼ କାତେ ପାଡ଼ହା କାନା।",
+]
+
+session_fp16 = InferenceSession("model_int8fp16_mixed_precision.onnx")
+
+os.makedirs("fp16_mixed_precision_fresh", exist_ok=True)
+latencies = []
+
+print("=== FP16 Mixed-Precision Benchmark ===\n")
+
+for idx, text in enumerate(test_sentences_odia_all_30):
+    token_ids = [token_map.get(c, 0) for c in text if c != ' ' and c in token_map]
+    
+    if not token_ids:
+        continue
+    
+    x = np.array([token_ids], dtype=np.int64)
+    x_length = np.array([len(token_ids)], dtype=np.int64)
+    noise_scale = np.array([0.667], dtype=np.float32)
+    length_scale = np.array([1.0], dtype=np.float32)
+    noise_scale_w = np.array([0.8], dtype=np.float32)
+    
+    start = time.time()
+    output = session_fp16.run(None, {
+        "x": x, "x_length": x_length,
+        "noise_scale": noise_scale, "length_scale": length_scale,
+        "noise_scale_w": noise_scale_w,
+    })
+    elapsed = time.time() - start
+    
+    audio = output[0].squeeze()
+    sf.write(f"fp16_mixed_precision_fresh/mixed_{idx:02d}.wav", audio, 16000)
+    latencies.append(elapsed)
+    
+    print(f"[{idx:02d}] {elapsed:.3f}s | {text[:40]}")
+
+print(f"\n=== FP16 Mixed-Precision Summary ===")
+print(f"Average latency: {np.mean(latencies):.3f}s")
+print(f"Min latency: {np.min(latencies):.3f}s")
+print(f"Max latency: {np.max(latencies):.3f}s")
+--- CODE CELL ---
+from pymcd.mcd import Calculate_MCD
+import numpy as np
+
+print("=== MCD Comparison: All Three Models ===\n")
+
+mcd_calc = Calculate_MCD(MCD_mode="dtw")
+
+models = [
+    ("INT8 (mixed, vocoder FP32)", "mixed_precision_fresh"),
+    ("INT8 + FP16 (vocoder FP16)", "fp16_mixed_precision_fresh"),
+]
+
+results = {}
+
+for model_name, folder in models:
+    mcd_scores = []
+    for idx in range(30):
+        baseline_file = f"baseline_fp32_fresh/baseline_{idx:02d}.wav"
+        model_file = f"{folder}/mixed_{idx:02d}.wav"
+        
+        try:
+            score = mcd_calc.calculate_mcd(baseline_file, model_file)
+            mcd_scores.append(score)
+        except:
+            pass
+    
+    results[model_name] = {
+        "mean": np.mean(mcd_scores),
+        "median": np.median(mcd_scores),
+        "std": np.std(mcd_scores),
+        "min": np.min(mcd_scores),
+        "max": np.max(mcd_scores),
+    }
+
+print(f"{'Model':<35} {'Mean':<8} {'Median':<8} {'Std':<8} {'Min':<8} {'Max':<8}")
+print("=" * 75)
+for model_name, stats in results.items():
+    print(f"{model_name:<35} {stats['mean']:<8.3f} {stats['median']:<8.3f} {stats['std']:<8.3f} {stats['min']:<8.3f} {stats['max']:<8.3f}")
+
+print("\n=== Quality Improvement ===")
+int8_mean = results["INT8 (mixed, vocoder FP32)"]["mean"]
+fp16_mean = results["INT8 + FP16 (vocoder FP16)"]["mean"]
+improvement = int8_mean - fp16_mean
+pct_improvement = (improvement / int8_mean) * 100
+
+print(f"INT8 mixed mean MCD:        {int8_mean:.3f} dB")
+print(f"INT8+FP16 mixed mean MCD:   {fp16_mean:.3f} dB")
+print(f"Improvement:                {improvement:.3f} dB ({pct_improvement:.1f}% better)")
+--- CODE CELL ---
+import onnx
+from onnxruntime.quantization import quantize_static, QuantType, CalibrationDataReader
+import numpy as np
+import os
+
+model_path = "model.onnx"
+onnx_model = onnx.load(model_path)
+
+# Strategy: Keep everything high-precision except duration predictor / length regulator
+# Identify text encoder nodes (early layers, before duration predictor)
+# and vocoder nodes (late layers, /dec/), exclude both from INT8
+
+EXCLUDE_NODES_AGGRESSIVE = []
+
+# Exclude all /dec/ (vocoder) nodes
+for node in onnx_model.graph.node:
+    for output in node.output:
+        if "/dec/" in output:
+            EXCLUDE_NODES_AGGRESSIVE.append(output)
+            break
+
+# Also exclude early text encoder layers (roughly first 30% of nodes)
+# These handle character embeddings and text representation
+early_encoder_cutoff = int(len(onnx_model.graph.node) * 0.30)
+for node in onnx_model.graph.node[:early_encoder_cutoff]:
+    for output in node.output:
+        EXCLUDE_NODES_AGGRESSIVE.append(output)
+
+print(f"Aggressive FP32 Preservation Strategy:")
+print(f"  Exclude from INT8 (keep FP32):")
+print(f"    - Early text encoder (0-30%): ~{early_encoder_cutoff} nodes")
+print(f"    - Vocoder (/dec/): {sum(1 for _ in onnx_model.graph.node if any('/dec/' in o for o in _.output))} nodes")
+print(f"  Quantize to INT8: ~{len(onnx_model.graph.node) - len(EXCLUDE_NODES_AGGRESSIVE)} duration/length regulator nodes")
+
+# Prepare calibration data
+test_sentences_odia_calib = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।", "ଆମ ଚେତ୍ କାନା?", "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?", "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।", "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।",
+]
+
+class VitsCalibrationReader(CalibrationDataReader):
+    def __init__(self, text_list, tokenizer_path):
+        self.data = []
+        token_map = {}
+        with open(tokenizer_path, encoding='utf-8') as f:
+            for line in f:
+                parts = line.rsplit(' ', 1)
+                if len(parts) == 2:
+                    token_map[parts[0]] = int(parts[1])
+        
+        for text in text_list:
+            token_ids = [token_map.get(c, 0) for c in text if c != ' ' and c in token_map]
+            if token_ids:
+                self.data.append(token_ids)
+        
+        self.index = 0
+
+    def get_next(self):
+        if self.index >= len(self.data):
+            return None
+        
+        token_ids = self.data[self.index]
+        x = np.array([token_ids], dtype=np.int64)
+        x_length = np.array([len(token_ids)], dtype=np.int64)
+        noise_scale = np.array([0.667], dtype=np.float32)
+        length_scale = np.array([1.0], dtype=np.float32)
+        noise_scale_w = np.array([0.8], dtype=np.float32)
+        
+        self.index += 1
+        
+        return {
+            "x": x,
+            "x_length": x_length,
+            "noise_scale": noise_scale,
+            "length_scale": length_scale,
+            "noise_scale_w": noise_scale_w,
+        }
+
+calib_reader = VitsCalibrationReader(test_sentences_odia_calib, "tokens.txt")
+
+print("\nQuantizing...")
+quantize_static(
+    model_input="model.onnx",
+    model_output="model_int8_aggressive_fp32.onnx",
+    calibration_data_reader=calib_reader,
+    weight_type=QuantType.QInt8,
+    per_channel=True,
+    nodes_to_exclude=EXCLUDE_NODES_AGGRESSIVE,
+)
+
+print("✅ Aggressive FP32 preservation quantization complete!")
+
+# Compare sizes
+int8_mixed_size = os.path.getsize("model_int8_mixed_precision.onnx") / 1e6
+aggressive_size = os.path.getsize("model_int8_aggressive_fp32.onnx") / 1e6
+
+print(f"\n=== File Sizes ===")
+print(f"INT8 mixed (vocoder FP32):        {int8_mixed_size:6.1f} MB")
+print(f"INT8 aggressive (encoder+vocoder FP32): {aggressive_size:6.1f} MB")
+print(f"Size increase: +{aggressive_size - int8_mixed_size:.1f} MB")
+print(f"\nStill within 100 MB budget? {aggressive_size < 100.0} (model={aggressive_size:.1f}MB, peak RAM estimate ~{aggressive_size*3:.0f}MB)")
+--- CODE CELL ---
+import numpy as np
+from onnxruntime import InferenceSession
+import soundfile as sf
+import os
+import time
+
+token_map = {}
+with open("tokens.txt", encoding='utf-8') as f:
+    for line in f:
+        parts = line.rsplit(' ', 1)
+        if len(parts) == 2:
+            token_map[parts[0]] = int(parts[1])
+
+test_sentences_odia_all_30 = [
+    "ଆଇଞ ମୁଂଡାରୀ କାତା଼ଞା।", "ଆମ ଚେତ୍ କାନା?", "ଆଇଞ ସିଖା କାନା।",
+    "ଆମ ଚେତ୍ ସିଖା କାନା?", "ନା଼ଵା ପାଡ଼ହା ସୁରୂ କାନା।",
+    "ମାସ୍ଟର ପାଡ଼ହା କୋ ସିଖା କାନା।", "ପୁସ୍ତକ ତାଲା ମେ।",
+    "କାଗଜ ଆର କଲମ ଆନା ମେ।", "ବୋର୍ଡ ରେ ନାଵା ଶବ୍ଦ ଓଲ ମେ।",
+    "ଆମ କିତାବ ପାଡ଼ହା ମେ।", "ଆଇଞ ସ୍କୂଲ ତେ ସେନୋ କାନା।",
+    "ଆମ ସ୍କୂଲ ତେ ଚେତ୍ ସେନୋ କାନା?", "ସେଲା଼ ହୋଡ଼ କୋ ସେଂଦରା କାନା।",
+    "ବୋଂଗା ରେ ଜୋମ କାନା।", "ଆଇଞ ଆଜ ଜୋମ କାନା।",
+    "ଆମ ଚେତ୍ ଜୋମ କାନା?", "ଦା଼ ମେନାକ୍ ତାହେନା।",
+    "ଦା଼ ଜୋମ ରେ ବେସେ ଜରୂରୀ କାନା।", "ଆଇଞ ଆମ ସା଼ଵ କାତା କାନା।",
+    "ଆମ ସା଼ଵ ସା଼ଵ ସେନୋ ମେ।", "ନା଼ଵା ପାଠ ଧ୍ଯାନ ତେ ପାଡ଼ହା ମେ।",
+    "ମାସ୍ଟର ରେ କାତା ଧ୍ଯାନ ତେ ଆଯୁବ ମେ।", "ବୋଲା ମେ, ଆମ ଚେତ୍ ସିଖା କାନା?",
+    "ସା଼ରୀ କାତା ବୋଲା ମେ।", "ଆଇଞ ନା଼ଵା କାତା ସିଖା କାନା।",
+    "ଆମ ପାଡ଼ହା କାତେ ନା଼ଵା କାତା ସିଖା ମେ।", "ସେଲା଼ କୋ ମୈଦାନ ରେ ଖେଲା କାନା।",
+    "ଆଇଞ କା଼ମୀ କାତେ ସ୍କୂଲ ତେ ସେନୋ କାନା।", "ଆମାକ୍ କିତାବ ଟେବୁଲ ରେ ମେନାକ୍ ତାହେନା।",
+    "ସବେ ହୋଡ଼ କୋ ମିଲା଼ କାତେ ପାଡ଼ହା କାନା।",
+]
+
+session_aggressive = InferenceSession("model_int8_aggressive_fp32.onnx")
+
+os.makedirs("aggressive_fp32_fresh", exist_ok=True)
+latencies = []
+
+print("=== Aggressive FP32 Preservation Benchmark ===\n")
+
+for idx, text in enumerate(test_sentences_odia_all_30):
+    token_ids = [token_map.get(c, 0) for c in text if c != ' ' and c in token_map]
+    
+    if not token_ids:
+        continue
+    
+    x = np.array([token_ids], dtype=np.int64)
+    x_length = np.array([len(token_ids)], dtype=np.int64)
+    noise_scale = np.array([0.667], dtype=np.float32)
+    length_scale = np.array([1.0], dtype=np.float32)
+    noise_scale_w = np.array([0.8], dtype=np.float32)
+    
+    start = time.time()
+    output = session_aggressive.run(None, {
+        "x": x, "x_length": x_length,
+        "noise_scale": noise_scale, "length_scale": length_scale,
+        "noise_scale_w": noise_scale_w,
+    })
+    elapsed = time.time() - start
+    
+    audio = output[0].squeeze()
+    sf.write(f"aggressive_fp32_fresh/mixed_{idx:02d}.wav", audio, 16000)
+    latencies.append(elapsed)
+    
+    print(f"[{idx:02d}] {elapsed:.3f}s")
+
+print(f"\nAverage latency: {np.mean(latencies):.3f}s")
+--- CODE CELL ---
+from pymcd.mcd import Calculate_MCD
+import numpy as np
+
+print("=== MCD Comparison ===\n")
+
+mcd_calc = Calculate_MCD(MCD_mode="dtw")
+
+models_compare = [
+    ("INT8 mixed (vocoder FP32)", "mixed_precision_fresh"),
+    ("INT8 aggressive (encoder+vocoder FP32)", "aggressive_fp32_fresh"),
+]
+
+for model_name, folder in models_compare:
+    mcd_scores = []
+    for idx in range(30):
+        baseline_file = f"baseline_fp32_fresh/baseline_{idx:02d}.wav"
+        model_file = f"{folder}/mixed_{idx:02d}.wav"
+        
+        try:
+            score = mcd_calc.calculate_mcd(baseline_file, model_file)
+            mcd_scores.append(score)
+        except:
+            pass
+    
+    scores = np.array(mcd_scores)
+    print(f"{model_name}:")
+    print(f"  Mean MCD: {np.mean(scores):.3f} dB")
+    print(f"  Std dev:  {np.std(scores):.3f} dB")
+    print(f"  Min/Max:  {np.min(scores):.3f} - {np.max(scores):.3f} dB")
+    print()
+--- CODE CELL ---
+# ── Cell: Test Mundari (unr) Speech-to-Text with facebook/mms-1b-all ──
+# pip install torch torchaudio transformers accelerate --break-system-packages
+# (run once, then restart kernel if needed)
+
+import torch
+import torchaudio
+from transformers import Wav2Vec2ForCTC, AutoProcessor
+
+MODEL_ID = "facebook/mms-1b-all"
+LANG = "unr"  # Mundari ISO 639-3 code
+AUDIO_PATH = "path/to/your/mundari_clip.wav"  # <-- set this to your test file
+
+# --- Load model + processor (first run downloads ~4GB) ---
+processor = AutoProcessor.from_pretrained(MODEL_ID)
+model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
+
+# --- Switch to Mundari adapter ---
+processor.tokenizer.set_target_lang(LANG)
+model.load_adapter(LANG)
+
+# --- Load and resample audio to 16kHz mono ---
+waveform, sr = torchaudio.load(AUDIO_PATH)
+if waveform.shape[0] > 1:
+    waveform = waveform.mean(dim=0, keepdim=True)  # stereo -> mono
+if sr != 16000:
+    resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+    waveform = resampler(waveform)
+
+audio_array = waveform.squeeze().numpy()
+
+# --- Run inference ---
+inputs = processor(audio_array, sampling_rate=16_000, return_tensors="pt")
+inputs = {k: v.to(device) for k, v in inputs.items()}
+
+with torch.no_grad():
+    outputs = model(**inputs).logits
+
+ids = torch.argmax(outputs, dim=-1)[0]
+transcription = processor.decode(ids)
+
+print("Transcription (Mundari):", transcription)
+--- CODE CELL ---
+# 1. Install required libraries (uncomment if you haven't installed them yet)
+!pip install transformers torch scipy IPython
+
+from transformers import VitsModel, AutoTokenizer
+import torch
+from IPython.display import Audio, display
+import scipy.io.wavfile as wavfile
+
+# 2. Load the Mundari MMS model and tokenizer
+model_id = "facebook/mms-tts-unr"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = VitsModel.from_pretrained(model_id)
+
+# 3. Define your Mundari sentence 
+# Note: MMS models often use the local script. Adjust to Devanagari/Odia depending on what the model expects.
+text = "ଦୁବଇ ଏଯର ପୋଟ କେ ରନବୀ ପର  ସ୍ଟାଇ ଜେଟ କୀ ଫ୍ଲାଇଟ  ଉଡାନ ବରନେ କୋ ପିଲ କୋଲତା ଯାରତୀ  ସଭୀ ପେସିଂଜେସ ଫଲାଇଟ କୀ" # Replace with your specific Mundari text
+
+# 4. Tokenize and synthesize
+print(f"Synthesizing: {text}")
+inputs = tokenizer(text, return_tensors="pt")
+
+with torch.no_grad():
+    output = model(**inputs).waveform
+
+# 5. Extract the audio array and sample rate
+audio_array = output.squeeze().cpu().numpy()
+sample_rate = model.config.sampling_rate
+
+# 6. Display playable audio widget in the notebook
+display(Audio(audio_array, rate=sample_rate))
+
+# Optional: Save to a WAV file
+wavfile.write("mundari_tts_output.wav", sample_rate, audio_array)
+print("Saved to mundari_tts_output.wav")
+
+--- CODE CELL ---
+# ── Mundari INT8-Dynamic ONNX TTS — Single-Cell Test ─────────────────────────
+import os
+import numpy as np
+import onnxruntime as rt
+import scipy.io.wavfile as wavfile
+from IPython.display import Audio, display
+
+# ── 1. Config (matches your config.json) ─────────────────────────────────────
+MODEL_PATH   = "model_int8_dynamic.onnx"
+TOKENS_PATH  = "tokens.txt"
+SAMPLE_RATE  = 16000   # config.json → data.sampling_rate
+ADD_BLANK    = True    # config.json → data.add_blank
+NOISE_SCALE  = 0.667
+LENGTH_SCALE = 1.0
+NOISE_SCALE_W = 0.8
+
+# ── 2. Load vocabulary from tokens.txt ───────────────────────────────────────
+char2id = {}
+with open(TOKENS_PATH, encoding="utf-8") as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.rsplit(" ", 1)
+        if len(parts) == 2:
+            char2id[parts[0]] = int(parts[1])
+
+print(f"✅ Vocabulary loaded: {len(char2id)} tokens")
+print("   Known chars:", list(char2id.keys())[:10], "...")
+
+# ── 3. Text → token IDs (with optional blank interleaving) ───────────────────
+def text_to_ids(text: str, vocab: dict, add_blank: bool = True) -> list[int]:
+    BLANK_ID = 0           # blank token appended after known vocab
+    ids = []
+    skipped = []
+    for ch in text:
+        if ch in vocab:
+            ids.append(vocab[ch])
+        else:
+            skipped.append(repr(ch))
+    if skipped:
+        print(f"⚠️  Skipped {len(skipped)} unknown chars: {set(skipped)}")
+    if add_blank:
+        # Interleave blank: [blank, t0, blank, t1, blank, ...]
+        result = []
+        for tid in ids:
+            result.append(BLANK_ID)
+            result.append(tid)
+        result.append(BLANK_ID)
+        return result
+    return ids
+
+# ── 4. Test sentences (Odia script Mundari) ──────────────────────────────────
+test_sentences = [
+    "ଦୁବଇ ଏଯର ପୋଟ କେ ରନବୀ ପର  ସ୍ଟାଇ ଜେଟ କୀ ଫ୍ଲାଇଟ  ଉଡାନ ବରନେ କୋ ପିଲ କୋଲତା ଯାରତୀ  ସଭୀ ପେସିଂଜେସ ଫଲାଇଟ କୀ"               # "Namaste / Hello"
+]
+
+# ── 5. Load ONNX model ────────────────────────────────────────────────────────
+print(f"\n📦 Loading: {MODEL_PATH}  ({os.path.getsize(MODEL_PATH)/1e6:.1f} MB)")
+sess_opts = rt.SessionOptions()
+sess_opts.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
+session = rt.InferenceSession(MODEL_PATH, sess_options=sess_opts,
+                              providers=["CPUExecutionProvider"])
+
+input_names  = [i.name for i in session.get_inputs()]
+output_names = [o.name for o in session.get_outputs()]
+print(f"✅ Model loaded   | Inputs: {input_names}  | Outputs: {output_names}")
+
+# ── 6. Synthesize each test sentence ─────────────────────────────────────────
+for idx, text in enumerate(test_sentences):
+    print(f"\n── [{idx+1}/{len(test_sentences)}] Synthesizing: '{text}' ──")
+
+    ids = text_to_ids(text, char2id, add_blank=ADD_BLANK)
+    if not ids:
+        print("   ❌ No valid tokens — skipping.")
+        continue
+
+    x        = np.array(ids, dtype=np.int64)[np.newaxis, :]       # (1, L)
+    x_length = np.array([x.shape[1]], dtype=np.int64)              # (1,)
+    noise    = np.array([NOISE_SCALE],   dtype=np.float32)
+    length   = np.array([LENGTH_SCALE],  dtype=np.float32)
+    noise_w  = np.array([NOISE_SCALE_W], dtype=np.float32)
+
+    feeds = {
+        "x":             x,
+        "x_length":      x_length,
+        "noise_scale":   noise,
+        "length_scale":  length,
+        "noise_scale_w": noise_w,
+    }
+
+    audio = session.run(output_names, feeds)[0]          # (1, 1, T)
+    audio = audio.squeeze()                               # (T,)
+
+    # Normalise to int16 range for WAV
+    audio_norm = audio / (np.abs(audio).max() + 1e-9)
+    audio_int16 = (audio_norm * 32767).astype(np.int16)
+
+    out_path = f"test_output_{idx+1}.wav"
+    wavfile.write(out_path, SAMPLE_RATE, audio_int16)
+
+    duration_s = len(audio) / SAMPLE_RATE
+    print(f"   ✅ {duration_s:.2f}s  →  saved: {out_path}")
+    display(Audio(audio_norm, rate=SAMPLE_RATE, autoplay=False))
+
+print("\n🎉 All done!")
+
